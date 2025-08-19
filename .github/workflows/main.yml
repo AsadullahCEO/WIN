@@ -1,39 +1,286 @@
-# Is workflow ka naam, jo GitHub UI mein dikhega
-name: Temporary RDP Session
+name: Provision Azure Windows RDP (Terraform • Azure • OIDC)
 
-# Yeh workflow tab run hoga jab aap isse GitHub ke "Actions" tab se manually chalaenge
 on:
   workflow_dispatch:
+    inputs:
+      location:
+        description: "Azure region (e.g., eastus, westeurope)"
+        required: true
+        default: "eastus"
+      vm_name:
+        description: "VM name (letters, numbers, hyphens)"
+        required: true
+        default: "win-rdp-vm"
+      vm_size:
+        description: "VM size (e.g., Standard_D16s_v5 ~= 64GB RAM; costs apply)"
+        required: true
+        default: "Standard_D16s_v5"
+      os_disk_size_gb:
+        description: "OS disk size in GB (e.g., 2000 for ~2TB; costs apply)"
+        required: true
+        default: "128"
+      data_disk_size_gb:
+        description: "Optional data disk size in GB (0 = none)"
+        required: true
+        default: "0"
+      allowed_ip:
+        description: "Your IP/CIDR for RDP (e.g., 203.0.113.45/32). DO NOT use 0.0.0.0/0"
+        required: true
+        default: "0.0.0.0/32"
+      admin_username:
+        description: "Windows admin username"
+        required: true
+        default: "azureadmin"
+      prefix:
+        description: "Name prefix for resources"
+        required: true
+        default: "rdp"
 
-# Yah ek job hai jiska naam 'rdp' hai
+      enable-sp-secret:
+        description: "Set to true ONLY if using a Service Principal client secret instead of OIDC"
+        required: true
+        default: "false"
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  rdp:
-    # Yeh job ek Windows runner par chalega.
-    # 'windows-latest' sabse powerful available runner hai.
-    runs-on: windows-latest
-    
-    # Is job ko 6 ghante tak chalne ki anumati deta hai (maximum limit)
-    timeout-minutes: 360
+  provision:
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: "true"
+      ARM_USE_OIDC: "true"
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+      ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+      TF_VAR_admin_password: ${{ secrets.ADMIN_PASSWORD }}
 
-    # Job ke saare steps yahan diye gaye hain
     steps:
-      # RDP session ke liye zaroori credentials set karein
-      - name: RDP credentials ko set karein
-        run: |
-          echo "RDP username: $env:GITHUB_ACTOR"
-          # Yahan RDP password GitHub repository secrets se aayega
-          echo "RDP password: ${{ secrets.RDP_PASSWORD }}"
-          
-      # Ek pre-built action ka use karenge jo RDP connection set karta hai
-      - name: RDP ko setup karein
-        uses: f0i/ms-rdp-action@v1
-        with:
-          # Aapko GitHub secrets mein 'RDP_PASSWORD' naam ka secret banana hoga
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Yeh step runner ko active rakhega jab tak aap disconnect nahi ho jaate
-      - name: RDP Session ko shuru karein
+      - name: Azure Login (OIDC or SP secret)
+        uses: azure/login@v2
+        with:
+          tenant-id:      ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id:${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id:      ${{ secrets.AZURE_CLIENT_ID }}
+          enable-AzPSSession: false
+          allow-no-subscriptions: false
+          # If using a Service Principal secret instead of OIDC:
+          # Set workflow input "enable-sp-secret" = true and provide AZURE_CLIENT_SECRET
+          client-secret: ${{ (github.event.inputs.enable-sp-secret == 'true') && secrets.AZURE_CLIENT_SECRET || '' }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Write Terraform (single-file main.tf)
+        shell: bash
         run: |
-          echo "RDP Session shuru ho raha hai..."
-          # Is loop se runner tab tak chalta rahega jab tak job ka timeout nahi ho jata
-          while ((1)) { Start-Sleep -Seconds 60 }
+          cat > main.tf <<'TF'
+          terraform {
+            required_providers {
+              azurerm = {
+                source  = "hashicorp/azurerm"
+                version = "~> 3.112"
+              }
+            }
+          }
+
+          provider "azurerm" {
+            features {}
+          }
+
+          variable "prefix"            { type = string }
+          variable "location"          { type = string }
+          variable "vm_name"           { type = string }
+          variable "vm_size"           { type = string }
+          variable "os_disk_size_gb"   { type = number }
+          variable "data_disk_size_gb" { type = number }
+          variable "allowed_ip"        { type = string }
+          variable "admin_username"    { type = string }
+          variable "admin_password"    { type = string }
+
+          locals {
+            rg_name  = "${var.prefix}-rg"
+            vnet     = "${var.prefix}-vnet"
+            subnet   = "${var.prefix}-subnet"
+            pip_name = "${var.prefix}-pip"
+            nsg_name = "${var.prefix}-nsg"
+            nic_name = "${var.prefix}-nic"
+          }
+
+          resource "azurerm_resource_group" "rg" {
+            name     = local.rg_name
+            location = var.location
+          }
+
+          resource "azurerm_virtual_network" "vnet" {
+            name                = local.vnet
+            address_space       = ["10.10.0.0/16"]
+            location            = azurerm_resource_group.rg.location
+            resource_group_name = azurerm_resource_group.rg.name
+          }
+
+          resource "azurerm_subnet" "subnet" {
+            name                 = local.subnet
+            resource_group_name  = azurerm_resource_group.rg.name
+            virtual_network_name = azurerm_virtual_network.vnet.name
+            address_prefixes     = ["10.10.1.0/24"]
+          }
+
+          resource "azurerm_public_ip" "pip" {
+            name                = local.pip_name
+            location            = azurerm_resource_group.rg.location
+            resource_group_name = azurerm_resource_group.rg.name
+            allocation_method   = "Static"
+            sku                 = "Standard"
+          }
+
+          resource "azurerm_network_security_group" "nsg" {
+            name                = local.nsg_name
+            location            = azurerm_resource_group.rg.location
+            resource_group_name = azurerm_resource_group.rg.name
+
+            security_rule {
+              name                       = "Allow-RDP-From-My-IP"
+              priority                   = 100
+              direction                  = "Inbound"
+              access                     = "Allow"
+              protocol                   = "Tcp"
+              source_port_range          = "*"
+              destination_port_range     = "3389"
+              source_address_prefix      = var.allowed_ip
+              destination_address_prefix = "*"
+            }
+          }
+
+          resource "azurerm_network_interface" "nic" {
+            name                = local.nic_name
+            location            = azurerm_resource_group.rg.location
+            resource_group_name = azurerm_resource_group.rg.name
+
+            ip_configuration {
+              name                          = "ipconfig1"
+              subnet_id                     = azurerm_subnet.subnet.id
+              private_ip_address_allocation = "Dynamic"
+              public_ip_address_id          = azurerm_public_ip.pip.id
+            }
+          }
+
+          resource "azurerm_network_interface_security_group_association" "nic_nsg" {
+            network_interface_id      = azurerm_network_interface.nic.id
+            network_security_group_id = azurerm_network_security_group.nsg.id
+          }
+
+          resource "azurerm_windows_virtual_machine" "vm" {
+            name                = var.vm_name
+            location            = azurerm_resource_group.rg.location
+            resource_group_name = azurerm_resource_group.rg.name
+            size                = var.vm_size
+
+            admin_username = var.admin_username
+            admin_password = var.admin_password
+
+            network_interface_ids = [
+              azurerm_network_interface.nic.id
+            ]
+
+            os_disk {
+              name                 = "${var.vm_name}-osdisk"
+              caching              = "ReadWrite"
+              storage_account_type = "Premium_LRS"
+              disk_size_gb         = var.os_disk_size_gb
+            }
+
+            source_image_reference {
+              publisher = "MicrosoftWindowsServer"
+              offer     = "WindowsServer"
+              sku       = "2022-datacenter-azure-edition"
+              version   = "latest"
+            }
+
+            boot_diagnostics {
+              storage_account_uri = null
+            }
+
+            # Enable RDP (Windows Server enables RDP; NSG rule controls exposure)
+            provision_vm_agent = true
+            allow_extension_operations = true
+          }
+
+          # Optional data disk
+          resource "azurerm_managed_disk" "data" {
+            count                = var.data_disk_size_gb > 0 ? 1 : 0
+            name                 = "${var.vm_name}-datadisk"
+            location             = azurerm_resource_group.rg.location
+            resource_group_name  = azurerm_resource_group.rg.name
+            storage_account_type = "Premium_LRS"
+            create_option        = "Empty"
+            disk_size_gb         = var.data_disk_size_gb
+          }
+
+          resource "azurerm_virtual_machine_data_disk_attachment" "attach" {
+            count              = var.data_disk_size_gb > 0 ? 1 : 0
+            managed_disk_id    = azurerm_managed_disk.data[0].id
+            virtual_machine_id = azurerm_windows_virtual_machine.vm.id
+            lun                = 0
+            caching            = "ReadOnly"
+          }
+
+          output "public_ip" {
+            value = azurerm_public_ip.pip.ip_address
+          }
+
+          output "rdp_hint" {
+            value = "Use Remote Desktop to ${azurerm_public_ip.pip.ip_address}:3389, user='${var.admin_username}'"
+          }
+          TF
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan
+        run: |
+          terraform plan \
+            -var "prefix=${{ github.event.inputs.prefix }}" \
+            -var "location=${{ github.event.inputs.location }}" \
+            -var "vm_name=${{ github.event.inputs.vm_name }}" \
+            -var "vm_size=${{ github.event.inputs.vm_size }}" \
+            -var "os_disk_size_gb=${{ github.event.inputs.os_disk_size_gb }}" \
+            -var "data_disk_size_gb=${{ github.event.inputs.data_disk_size_gb }}" \
+            -var "allowed_ip=${{ github.event.inputs.allowed_ip }}" \
+            -var "admin_username=${{ github.event.inputs.admin_username }}"
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var "prefix=${{ github.event.inputs.prefix }}" \
+            -var "location=${{ github.event.inputs.location }}" \
+            -var "vm_name=${{ github.event.inputs.vm_name }}" \
+            -var "vm_size=${{ github.event.inputs.vm_size }}" \
+            -var "os_disk_size_gb=${{ github.event.inputs.os_disk_size_gb }}" \
+            -var "data_disk_size_gb=${{ github.event.inputs.data_disk_size_gb }}" \
+            -var "allowed_ip=${{ github.event.inputs.allowed_ip }}" \
+            -var "admin_username=${{ github.event.inputs.admin_username }}"
+
+      - name: Show Connection Info
+        id: out
+        run: |
+          IP=$(terraform output -raw public_ip)
+          HINT=$(terraform output -raw rdp_hint)
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          {
+            echo "## ✅ VM is ready"
+            echo ""
+            echo "**Public IP:** \`$IP\`"
+            echo "**RDP:** Open Remote Desktop to \`$IP:3389\`"
+            echo "**Username:** \`${{ github.event.inputs.admin_username }}\`"
+            echo "**Password:** (from repo secret \`ADMIN_PASSWORD\`)"
+            echo ""
+            echo "> RDP access is restricted to: \`${{ github.event.inputs.allowed_ip }}\`"
+            echo "> Remember to deprovision when you're done to stop charges."
+          } >> $GITHUB_STEP_SUMMARY
