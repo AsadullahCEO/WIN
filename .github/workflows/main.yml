@@ -1,0 +1,39 @@
+# Is workflow ka naam, jo GitHub UI mein dikhega
+name: Temporary RDP Session
+
+# Yeh workflow tab run hoga jab aap isse GitHub ke "Actions" tab se manually chalaenge
+on:
+  workflow_dispatch:
+
+# Yah ek job hai jiska naam 'rdp' hai
+jobs:
+  rdp:
+    # Yeh job ek Windows runner par chalega.
+    # 'windows-latest' sabse powerful available runner hai.
+    runs-on: windows-latest
+    
+    # Is job ko 6 ghante tak chalne ki anumati deta hai (maximum limit)
+    timeout-minutes: 360
+
+    # Job ke saare steps yahan diye gaye hain
+    steps:
+      # RDP session ke liye zaroori credentials set karein
+      - name: RDP credentials ko set karein
+        run: |
+          echo "RDP username: $env:GITHUB_ACTOR"
+          # Yahan RDP password GitHub repository secrets se aayega
+          echo "RDP password: ${{ secrets.RDP_PASSWORD }}"
+          
+      # Ek pre-built action ka use karenge jo RDP connection set karta hai
+      - name: RDP ko setup karein
+        uses: f0i/ms-rdp-action@v1
+        with:
+          # Aapko GitHub secrets mein 'RDP_PASSWORD' naam ka secret banana hoga
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+      # Yeh step runner ko active rakhega jab tak aap disconnect nahi ho jaate
+      - name: RDP Session ko shuru karein
+        run: |
+          echo "RDP Session shuru ho raha hai..."
+          # Is loop se runner tab tak chalta rahega jab tak job ka timeout nahi ho jata
+          while ((1)) { Start-Sleep -Seconds 60 }
